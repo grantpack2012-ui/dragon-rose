@@ -716,6 +716,260 @@ const COLOR_NAMES = {
 };
 
 // ============================================================
+// IMAGE GENERATION — Flux prompt system
+// Each egg carries the full genetics of the creature inside.
+// Color percentages are rolled per-egg for organic variation,
+// so no two clutchmates share an identical palette.
+// ============================================================
+
+// Per-species texture signatures (the canonical brush/surface look)
+const TEXTURE_SIGNATURES = {
+  earth: "soft pencil-crosshatch shading over a matte carved-stone surface",
+  air: "liquid-mercury chrome sheen, smooth and reflective",
+  fire: "warm molten swirling texture with a glowing ember surface",
+  water: "refracted rippling light across a translucent prismatic surface",
+  day: "radiant liquid-gold sheen, sunlit and metallic",
+  night: "swirling galaxy-marble texture flecked with scattered starlight",
+  rainbow: "pewter-grey body with an iridescent rainbow-gradient sheen",
+  silver: "polished satin metallic sheen, smooth and lustrous",
+};
+
+// Brief body silhouette per species (for creature prompts)
+const BODY_SIGNATURES = {
+  earth: "sturdy grounded wingless body with hoof-like feet",
+  air: "slim lightly-built body with oversized glider wings",
+  fire: "lean predatory body with strong angular wings",
+  water: "sleek serpentine body with fan-finned tail",
+  day: "graceful radiant body with broad wings",
+  night: "elegant dark-scaled body with star-flecked wings",
+  rainbow: "delicate body with broad butterfly-shaped wings",
+  silver: "regal slender body with prismatic membrane wings",
+};
+
+// Descriptive Flux-ready color phrases (richer than the terse display names)
+const FLUX_COLOR_WORDS = {
+  G: "rich forest green", W: "pale chrome white", B: "deep ocean blue",
+  R: "deep molten red", Y: "golden yellow", L: "near-black galaxy black",
+  b: "earthy brown", a: "bright aqua", r: "full rainbow gradient",
+  s: "polished silver", o: "warm amber orange", z: "burnished bronze",
+  P: "rich royal purple",
+};
+
+// ----- Hue/shade randomization: each egg gets unique hex codes -----
+
+function hexToHsl(hex) {
+  let h = hex.replace("#", "");
+  if (h.length === 3) h = h.split("").map(c => c + c).join("");
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let hue = 0, sat = 0; const light = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    sat = light > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) hue = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue *= 60;
+  }
+  return { h: hue, s: sat * 100, l: light * 100 };
+}
+
+function hslToHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s = Math.max(0, Math.min(100, s)) / 100; l = Math.max(0, Math.min(100, l)) / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  const toHex = v => Math.round((v + m) * 255).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+// Per-color jitter ranges (degrees / percent). Neutral colors jitter hue less.
+const COLOR_JITTER = {
+  R: { h: 14, s: 16, l: 12 }, G: { h: 16, s: 16, l: 12 }, B: { h: 16, s: 16, l: 12 },
+  Y: { h: 10, s: 14, l: 10 }, o: { h: 12, s: 14, l: 12 }, a: { h: 14, s: 16, l: 12 },
+  b: { h: 12, s: 16, l: 14 }, P: { h: 16, s: 16, l: 12 }, z: { h: 12, s: 16, l: 14 },
+  W: { h: 30, s: 8, l: 8 }, L: { h: 30, s: 10, l: 10 }, s: { h: 30, s: 8, l: 10 },
+};
+const DEFAULT_JITTER = { h: 14, s: 14, l: 12 };
+
+// Roll a unique hex within a color's family, plus a shade word from lightness
+function rollColorShade(code) {
+  const baseHex = COLOR_HEX[code];
+  if (!baseHex || (typeof baseHex === "string" && baseHex.startsWith("linear"))) {
+    return { hex: null, shade: "" }; // rainbow / gradient — no single hex
+  }
+  const base = hexToHsl(baseHex);
+  const j = COLOR_JITTER[code] || DEFAULT_JITTER;
+  const rand = (range) => (Math.random() * 2 - 1) * range;
+  const lFinal = base.l + rand(j.l);
+  const hex = hslToHex(base.h + rand(j.h), base.s + rand(j.s), lFinal);
+
+  // Derive a shade word from how the rolled lightness landed vs the base
+  const delta = lFinal - base.l;
+  const neutral = code === "W" || code === "L" || code === "s";
+  let shade = "";
+  if (neutral) {
+    shade = delta <= -5 ? "soft" : delta >= 6 ? "bright" : "";
+  } else {
+    shade = delta <= -7 ? "deep" : delta >= 8 ? "bright" : "rich";
+  }
+  return { hex, shade };
+}
+
+// Roll an organic per-egg color distribution from an allele code.
+// Dominant (uppercase) and primary-position colors get larger shares;
+// recessive (lowercase) colors read as accents. Per-egg jitter ensures
+// clutchmates vary naturally. Each color also gets a unique rolled hex.
+// Returns [{ code, name, word, shade, hex, pct }] desc by pct.
+function rollColorPercentages(colorCode) {
+  if (!colorCode) return [];
+  const chars = colorCode.split("");
+
+  // Rainbow special case — a rainbow allele dominates as a gradient
+  if (chars.includes("r")) {
+    const others = chars.filter(c => c !== "r");
+    if (others.length === 0) {
+      return [{ code: "r", name: "rainbow", word: FLUX_COLOR_WORDS.r, shade: "", hex: null, pct: 100 }];
+    }
+    const rPct = 60 + Math.floor(Math.random() * 16); // 60–75
+    const o = others[0];
+    const oShade = rollColorShade(o);
+    return [
+      { code: "r", name: COLOR_NAMES.r, word: FLUX_COLOR_WORDS.r, shade: "", hex: null, pct: rPct },
+      { code: o, name: COLOR_NAMES[o] || o, word: FLUX_COLOR_WORDS[o] || o, shade: oShade.shade, hex: oShade.hex, pct: 100 - rPct },
+    ];
+  }
+
+  // Merge duplicate alleles, tracking the strongest position + case
+  const seen = {};
+  chars.forEach((c, i) => {
+    const isUpper = c === c.toUpperCase() && c.toLowerCase() !== c.toUpperCase();
+    const posFactor = i === 0 ? 3.0 : i === 1 ? 2.0 : 1.3;
+    const caseFactor = isUpper ? 1.0 : 0.45; // recessive = smaller share
+    const weight = posFactor * caseFactor;
+    if (!seen[c]) seen[c] = 0;
+    seen[c] += weight;
+  });
+
+  // Apply per-egg jitter, then normalize to 100
+  const entries = Object.entries(seen).map(([code, weight]) => ({
+    code,
+    weight: weight * (0.8 + Math.random() * 0.4), // ±20% jitter
+  }));
+  const totalWeight = entries.reduce((s, e) => s + e.weight, 0) || 1;
+  let pcts = entries.map(e => {
+    const shade = rollColorShade(e.code);
+    return {
+      code: e.code,
+      name: COLOR_NAMES[e.code] || e.code,
+      word: FLUX_COLOR_WORDS[e.code] || (COLOR_NAMES[e.code] || e.code),
+      shade: shade.shade,
+      hex: shade.hex,
+      pct: Math.round((e.weight / totalWeight) * 100),
+    };
+  });
+
+  // Fix rounding drift so percentages sum to exactly 100
+  pcts.sort((a, b) => b.pct - a.pct);
+  const drift = 100 - pcts.reduce((s, p) => s + p.pct, 0);
+  if (pcts.length) pcts[0].pct += drift;
+
+  return pcts;
+}
+
+// Turn rolled percentages into a natural-language phrase for the prompt.
+// Includes the rolled shade word and the generated hex per color.
+function colorPercentagesToPhrase(pcts) {
+  if (!pcts || !pcts.length) return "";
+  return pcts.map(p => {
+    const desc = p.shade ? `${p.shade} ${p.word}` : p.word;
+    const hex = p.hex ? ` (${p.hex})` : "";
+    return `${p.pct}% ${desc}${hex}`;
+  }).join(", ");
+}
+
+// Determine the texture phrase for an egg's creature (blends hybrid parents)
+function getEggTexture(egg) {
+  if (egg.speciesKey && TEXTURE_SIGNATURES[egg.speciesKey]) {
+    return TEXTURE_SIGNATURES[egg.speciesKey];
+  }
+  const keys = (egg.parentSpeciesKeys || []).filter(k => TEXTURE_SIGNATURES[k]);
+  if (keys.length === 2 && keys[0] !== keys[1]) {
+    return `a blend of ${TEXTURE_SIGNATURES[keys[0]]} and ${TEXTURE_SIGNATURES[keys[1]]}`;
+  }
+  if (keys.length >= 1) return TEXTURE_SIGNATURES[keys[0]];
+  return "hand-painted scaled surface";
+}
+
+const ART_STYLE_BOILERPLATE = "heavy black outlines with organic line weight variation, hand-painted textured fill, white background";
+
+// Build the copy-ready Flux prompt for the EGG image
+function buildEggFluxPrompt(egg) {
+  const pcts = egg.colorPercentages || rollColorPercentages(egg.colorCode);
+  const colorPhrase = colorPercentagesToPhrase(pcts);
+  const texture = getEggTexture(egg);
+  const speciesLabel = egg.hybridLabel
+    ? `${egg.hybridLabel} hybrid`
+    : (egg.speciesKey ? `${SPECIES[egg.speciesKey]?.name || egg.speciesKey}` : "dragon");
+  const mutationNote = egg.mutationDef ? `, ${egg.mutationDef.shortName || egg.mutationDef.name} mutation coloration` : "";
+
+  return `dragonrose, a single ${speciesLabel} egg, ${texture}, colored ${colorPhrase}${mutationNote}, smooth ovoid egg shape, ${ART_STYLE_BOILERPLATE}`;
+}
+
+// Build the copy-ready Flux prompt for the ADULT CREATURE (consistent with the egg's genetics)
+function buildCreatureFluxPrompt(egg) {
+  const pcts = egg.colorPercentages || rollColorPercentages(egg.colorCode);
+  const colorPhrase = colorPercentagesToPhrase(pcts);
+  const texture = getEggTexture(egg);
+  const speciesLabel = egg.hybridLabel
+    ? `${egg.hybridLabel} hybrid dragon`
+    : (egg.speciesKey ? `${SPECIES[egg.speciesKey]?.name || egg.speciesKey}` : "dragon");
+  const bodyKey = egg.speciesKey || (egg.parentSpeciesKeys || [])[0];
+  const body = BODY_SIGNATURES[bodyKey] || "scaled dragon body";
+
+  // Attachments
+  const parts = [];
+  const ws = egg.wingShape;
+  if (ws && ws.winged) {
+    const membrane = egg.attachmentColor && egg.attachmentColor !== "Body Palette"
+      ? `${egg.attachmentColor} membrane`
+      : "body-colored membrane";
+    parts.push(`${ws.result || "dragon"} wings with ${membrane}`);
+  } else {
+    parts.push("wingless");
+  }
+  if (egg.tailTip?.result) parts.push(`${egg.tailTip.result} tail tip`);
+  if (egg.headCrest?.result) parts.push(`${egg.headCrest.result} head crest`);
+  if (egg.spineType?.result) parts.push(`${egg.spineType.result} along the spine`);
+
+  const mutationNote = egg.mutationDef ? `, ${egg.mutationDef.shortName || egg.mutationDef.name} mutation coloration` : "";
+  const lifecycle = egg.isMetamorphic ? ", metamorphic butterfly-lifecycle dragon" : "";
+
+  return `dragonrose, a ${speciesLabel}, ${body}, ${texture}, colored ${colorPhrase}${mutationNote}, ${parts.join(", ")}${lifecycle}, all four legs visible in a standing pose, ${ART_STYLE_BOILERPLATE}`;
+}
+
+// Attach generation data to a freshly bred egg (color roll + both prompts)
+function attachGenerationData(egg) {
+  const colorPercentages = rollColorPercentages(egg.colorCode);
+  const withPcts = { ...egg, colorPercentages };
+  return {
+    ...withPcts,
+    eggPrompt: buildEggFluxPrompt(withPcts),
+    creaturePrompt: buildCreatureFluxPrompt(withPcts),
+  };
+}
+
+
+// ============================================================
 // PUREBRED MUTATIONS
 // Each species has one recessive mutation. Both parents must
 // carry the allele (status "carrier" or "expressed") for the
@@ -2857,6 +3111,76 @@ function ClaimedEggTile({ egg }) {
   );
 }
 
+// Reusable copy-to-clipboard prompt block for Flux image generation
+function PromptBlock({ label, prompt }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(prompt).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      });
+    }
+  };
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+        <span style={{ color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 9, letterSpacing: 1 }}>{label}</span>
+        <button onClick={copy} style={{
+          background: copied ? "rgba(126,200,126,0.15)" : "rgba(200,148,63,0.1)",
+          border: `1px solid ${copied ? "rgba(126,200,126,0.4)" : "rgba(200,148,63,0.3)"}`,
+          color: copied ? "#7ec87e" : "#c8943f", borderRadius: 5, padding: "2px 10px",
+          fontFamily: "'Cinzel', serif", fontSize: 9, letterSpacing: 1, cursor: "pointer",
+        }}>{copied ? "✓ Copied" : "Copy"}</button>
+      </div>
+      <div style={{
+        background: "rgba(0,0,0,0.4)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 6,
+        padding: "8px 10px", fontSize: 11, color: "#b8a888", fontFamily: "'Crimson Text', serif",
+        lineHeight: 1.6, userSelect: "all",
+      }}>{prompt}</div>
+    </div>
+  );
+}
+
+// Color percentage bar — shows the organic per-egg color distribution + rolled hexes
+function ColorPercentBar({ percentages }) {
+  if (!percentages || !percentages.length) return null;
+  const palette = percentages.filter(p => p.hex).map(p => p.hex).join(", ");
+  const copyPalette = () => {
+    if (palette && navigator.clipboard?.writeText) navigator.clipboard.writeText(palette);
+  };
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ display: "flex", height: 12, borderRadius: 6, overflow: "hidden", border: "1px solid rgba(255,255,255,0.1)" }}>
+        {percentages.map((p, i) => {
+          const staticHex = COLOR_HEX[p.code];
+          const bg = p.hex || (typeof staticHex === "string" && staticHex.startsWith("linear") ? staticHex : (staticHex || "#555"));
+          return <div key={i} style={{ width: `${p.pct}%`, background: bg }} title={`${p.pct}% ${p.name}${p.hex ? " " + p.hex : ""}`} />;
+        })}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 10px", marginTop: 5 }}>
+        {percentages.map((p, i) => (
+          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10, color: "#8a7e6a" }}>
+            <span style={{
+              width: 9, height: 9, borderRadius: 2, flexShrink: 0,
+              background: p.hex || (typeof COLOR_HEX[p.code] === "string" && COLOR_HEX[p.code].startsWith("linear") ? COLOR_HEX[p.code] : (COLOR_HEX[p.code] || "#555")),
+              border: "1px solid rgba(255,255,255,0.15)",
+            }} />
+            {p.pct}% {p.name}{p.hex && <span style={{ color: "#6a6050", fontFamily: "monospace", fontSize: 9 }}>{p.hex}</span>}
+          </span>
+        ))}
+      </div>
+      {palette && (
+        <button onClick={copyPalette} style={{
+          marginTop: 6, background: "rgba(200,148,63,0.08)", border: "1px solid rgba(200,148,63,0.25)",
+          color: "#c8943f", borderRadius: 5, padding: "2px 10px", fontFamily: "'Cinzel', serif",
+          fontSize: 9, letterSpacing: 1, cursor: "pointer",
+        }}>Copy palette hexes</button>
+      )}
+    </div>
+  );
+}
+
 // Claim modal — appears when an egg is clicked
 function ClaimEggModal({ egg, clutchHybridLabel, motherId, fatherId, clutchId, onClaim, onClose }) {
   const { addToRoster } = useRoster() || {};
@@ -2902,7 +3226,8 @@ function ClaimEggModal({ egg, clutchHybridLabel, motherId, fatherId, clutchId, o
         <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 10, padding: 14, marginBottom: 16, fontSize: 12, fontFamily: "'Crimson Text', serif", color: "#c8b89a", lineHeight: 1.8 }}>
           <div style={{ color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 10, letterSpacing: 2, marginBottom: 8 }}>GENETICS</div>
           <div><strong style={{ color: "#e8dcc8" }}>Colors:</strong> {egg.colorDisplay}</div>
-          <div><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
+          <ColorPercentBar percentages={egg.colorPercentages} />
+          <div style={{ marginTop: 6 }}><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Wing Shape:</strong> {egg.wingShape?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Tail Tip:</strong> {egg.tailTip?.result}{acTag} · <strong style={{ color: "#e8dcc8" }}>Head Crest:</strong> {egg.headCrest?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Spines:</strong> {egg.spineType?.result}</div>
@@ -2917,6 +3242,18 @@ function ClaimEggModal({ egg, clutchHybridLabel, motherId, fatherId, clutchId, o
             </div>
           )}
         </div>
+
+        {/* Image generation prompts */}
+        {(egg.eggPrompt || egg.creaturePrompt) && (
+          <div style={{ background: "rgba(200,148,63,0.04)", border: "1px solid rgba(200,148,63,0.15)", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+            <div style={{ color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 10, letterSpacing: 2, marginBottom: 10 }}>IMAGE GENERATION — FLUX PROMPTS</div>
+            {egg.eggPrompt && <PromptBlock label="EGG" prompt={egg.eggPrompt} />}
+            {egg.creaturePrompt && <PromptBlock label="ADULT CREATURE" prompt={egg.creaturePrompt} />}
+            <div style={{ fontSize: 10, color: "#6a6050", fontStyle: "italic", marginTop: 4 }}>
+              Color percentages are locked to this egg — the creature stays consistent across its lifecycle.
+            </div>
+          </div>
+        )}
 
         {/* Claim form */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -3047,7 +3384,8 @@ function PairCard({ pair }) {
     const clutchSize = mProxy.eggPer || 4;
     const eggs = Array.from({ length: clutchSize }, (_, i) => {
       const result = breedTwo(mProxy, fProxy, customHybrids);
-      return { ...result, eggNum: i + 1, id: Date.now().toString(36) + i, claimed: false, claimedName: null, claimedRosterId: null };
+      const withGen = attachGenerationData(result);
+      return { ...withGen, eggNum: i + 1, id: Date.now().toString(36) + i, claimed: false, claimedName: null, claimedRosterId: null };
     });
 
     const hybridLabel = eggs[0]?.hybridLabel || "";
@@ -3412,11 +3750,18 @@ function generateWildClutch(clutchName) {
   // Reassign egg numbers after shuffle
   eggs.forEach((e, i) => { e.eggNum = i + 1; });
 
+  // Attach image-generation data (color roll + Flux prompts) to every egg
+  const eggsWithGen = eggs.map(e => ({ ...attachGenerationData(e), ...{
+    id: e.id, eggNum: e.eggNum, wildSpeciesKey: e.wildSpeciesKey,
+    special: e.special, specialNote: e.specialNote, mutationStatus: e.mutationStatus,
+    claimed: e.claimed, claimedName: e.claimedName, claimedBy: e.claimedBy, claimedRosterId: e.claimedRosterId,
+  }}));
+
   return {
     id,
     name: clutchName || `Wild Clutch`,
     createdAt: new Date().toISOString(),
-    eggs,
+    eggs: eggsWithGen,
     active: true,
   };
 }
@@ -3502,7 +3847,8 @@ function WildClaimModal({ egg, clutchName, onClaim, onClose }) {
         <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 10, padding: 14, marginBottom: 16, fontSize: 12, fontFamily: "'Crimson Text', serif", color: "#c8b89a", lineHeight: 1.8 }}>
           <div style={{ color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 10, letterSpacing: 2, marginBottom: 8 }}>GENETICS — {speciesName}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Colors:</strong> {egg.colorDisplay}</div>
-          <div><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
+          <ColorPercentBar percentages={egg.colorPercentages} />
+          <div style={{ marginTop: 6 }}><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Wing Shape:</strong> {egg.wingShape?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Tail / Crest / Spines:</strong> {egg.tailTip?.result} · {egg.headCrest?.result} · {egg.spineType?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Eggs/Clutch:</strong> {egg.eggDisplay}</div>
@@ -3514,6 +3860,15 @@ function WildClaimModal({ egg, clutchName, onClaim, onClose }) {
             <div style={{ marginTop: 6, color: "#c0c0d8", fontStyle: "italic" }}>✦ Rare Silver Filament Dragon</div>
           )}
         </div>
+
+        {/* Image generation prompts */}
+        {(egg.eggPrompt || egg.creaturePrompt) && (
+          <div style={{ background: "rgba(200,148,63,0.04)", border: "1px solid rgba(200,148,63,0.15)", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+            <div style={{ color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 10, letterSpacing: 2, marginBottom: 10 }}>IMAGE GENERATION — FLUX PROMPTS</div>
+            {egg.eggPrompt && <PromptBlock label="EGG" prompt={egg.eggPrompt} />}
+            {egg.creaturePrompt && <PromptBlock label="ADULT CREATURE" prompt={egg.creaturePrompt} />}
+          </div>
+        )}
 
         {/* Claim form */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
