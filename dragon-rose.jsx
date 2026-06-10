@@ -746,13 +746,14 @@ const BODY_SIGNATURES = {
   silver: "regal slender body with prismatic membrane wings",
 };
 
-// Descriptive Flux-ready color phrases (richer than the terse display names)
+// Descriptive Flux-ready color phrases — kept neutral on intensity so the
+// rolled shade word ("deep" / "rich" / "bright") supplies that without collision.
 const FLUX_COLOR_WORDS = {
-  G: "rich forest green", W: "pale chrome white", B: "deep ocean blue",
-  R: "deep molten red", Y: "golden yellow", L: "near-black galaxy black",
-  b: "earthy brown", a: "bright aqua", r: "full rainbow gradient",
-  s: "polished silver", o: "warm amber orange", z: "burnished bronze",
-  P: "rich royal purple",
+  G: "forest green", W: "chrome white", B: "ocean blue",
+  R: "molten red", Y: "golden yellow", L: "galaxy black",
+  b: "earthy brown", a: "aqua", r: "full rainbow gradient",
+  s: "silver", o: "amber orange", z: "bronze",
+  P: "royal purple",
 };
 
 // ----- Hue/shade randomization: each egg gets unique hex codes -----
@@ -897,6 +898,60 @@ function colorPercentagesToPhrase(pcts) {
   }).join(", ");
 }
 
+// ----- Wing membrane colors -----
+// Maps each canon membrane signature to a base hex + clean Flux phrase.
+// Gradient/iridescent membranes have no single hex. Body-palette membranes
+// (null) pull their color from the egg's dominant rolled body color.
+const MEMBRANE_SIGNATURES = {
+  "Mercury / Blue Wash": { hex: "#9fb4cc", word: "mercury blue-wash chrome" },
+  "Molten Layered": { hex: "#d4581f", word: "molten layered ember" },
+  "Liquid Gold": { hex: "#e8b020", word: "liquid gold" },
+  "Wrought-Iron Dark": { hex: "#2e2e3a", word: "wrought-iron" },
+  "Warm Amber Gold": { hex: "#e8a020", word: "amber gold" },
+  "Deep Cobalt / Electric": { hex: "#1a3fa0", word: "electric cobalt" },
+  "Deep Amber Bronze": { hex: "#a86420", word: "amber bronze" },
+  "Pale Ice / Frost": { hex: "#d8e2f0", word: "ice-frost" },
+  "Rainbow Gradient": { gradient: true, word: "full rainbow gradient" },
+  "Iridescent Prismatic": { gradient: true, word: "iridescent prismatic shimmer" },
+  "Lunar Rainbow — Silver/Violet Gradient": { gradient: true, word: "lunar silver-violet gradient" },
+  "Violet-Gold Iridescent": { gradient: true, word: "violet-gold iridescent shimmer" },
+};
+const MEMBRANE_JITTER = { h: 12, s: 14, l: 12 };
+
+// Roll the membrane description + hex for an egg's creature.
+// bodyPcts = the egg's rolled colorPercentages (used for body-palette membranes).
+// Returns { phrase, hex, gradientBg } — gradientBg set for gradient swatches.
+function rollMembrane(attachmentColor, bodyPcts) {
+  // Body-palette membrane (Earth, Water, Jade, Abyssal): match the dominant body color
+  if (!attachmentColor || attachmentColor === "Body Palette" || attachmentColor === "null") {
+    const dom = (bodyPcts || []).find(p => p.hex) || (bodyPcts || [])[0];
+    if (dom && dom.hex) {
+      const desc = dom.shade ? `${dom.shade} ${dom.word}` : dom.word;
+      return { phrase: `body-colored membrane matching the ${desc} body (${dom.hex})`, hex: dom.hex };
+    }
+    if (dom) {
+      const desc = dom.shade ? `${dom.shade} ${dom.word}` : dom.word;
+      return { phrase: `body-colored membrane matching the ${desc} body`, hex: null, gradientBg: COLOR_HEX.r };
+    }
+    return { phrase: "body-colored membrane", hex: null };
+  }
+  const sig = MEMBRANE_SIGNATURES[attachmentColor];
+  if (!sig) {
+    return { phrase: `${attachmentColor} membrane`, hex: null }; // unknown — pass through
+  }
+  if (sig.gradient) {
+    return { phrase: `${sig.word} membrane`, hex: null, gradientBg: COLOR_HEX.r };
+  }
+  // Solid membrane — roll a unique hex within its family + a shade word
+  const base = hexToHsl(sig.hex);
+  const rand = (r) => (Math.random() * 2 - 1) * r;
+  const lFinal = base.l + rand(MEMBRANE_JITTER.l);
+  const hex = hslToHex(base.h + rand(MEMBRANE_JITTER.h), base.s + rand(MEMBRANE_JITTER.s), lFinal);
+  const delta = lFinal - base.l;
+  const shade = delta <= -7 ? "deep" : delta >= 8 ? "bright" : "rich";
+  return { phrase: `${shade} ${sig.word} membrane (${hex})`, hex };
+}
+
 // Determine the texture phrase for an egg's creature (blends hybrid parents)
 function getEggTexture(egg) {
   if (egg.speciesKey && TEXTURE_SIGNATURES[egg.speciesKey]) {
@@ -940,10 +995,8 @@ function buildCreatureFluxPrompt(egg) {
   const parts = [];
   const ws = egg.wingShape;
   if (ws && ws.winged) {
-    const membrane = egg.attachmentColor && egg.attachmentColor !== "Body Palette"
-      ? `${egg.attachmentColor} membrane`
-      : "body-colored membrane";
-    parts.push(`${ws.result || "dragon"} wings with ${membrane}`);
+    const membranePhrase = egg.membranePhrase || rollMembrane(egg.attachmentColor, pcts).phrase;
+    parts.push(`${ws.result || "dragon"} wings with ${membranePhrase}`);
   } else {
     parts.push("wingless");
   }
@@ -957,14 +1010,15 @@ function buildCreatureFluxPrompt(egg) {
   return `dragonrose, a ${speciesLabel}, ${body}, ${texture}, colored ${colorPhrase}${mutationNote}, ${parts.join(", ")}${lifecycle}, all four legs visible in a standing pose, ${ART_STYLE_BOILERPLATE}`;
 }
 
-// Attach generation data to a freshly bred egg (color roll + both prompts)
+// Attach generation data to a freshly bred egg (color roll + membrane + both prompts)
 function attachGenerationData(egg) {
   const colorPercentages = rollColorPercentages(egg.colorCode);
-  const withPcts = { ...egg, colorPercentages };
+  const membrane = rollMembrane(egg.attachmentColor, colorPercentages);
+  const withGen = { ...egg, colorPercentages, membranePhrase: membrane.phrase, membraneHex: membrane.hex, membraneGradientBg: membrane.gradientBg || null };
   return {
-    ...withPcts,
-    eggPrompt: buildEggFluxPrompt(withPcts),
-    creaturePrompt: buildCreatureFluxPrompt(withPcts),
+    ...withGen,
+    eggPrompt: buildEggFluxPrompt(withGen),
+    creaturePrompt: buildCreatureFluxPrompt(withGen),
   };
 }
 
@@ -3111,6 +3165,21 @@ function ClaimedEggTile({ egg }) {
   );
 }
 
+// Small inline swatch + label for the rolled wing membrane
+function MembraneSwatch({ egg }) {
+  if (!egg.wingShape?.winged) return null;
+  const bg = egg.membraneHex || egg.membraneGradientBg || "#555";
+  const label = (egg.membranePhrase || "").replace(/ membrane.*$/, "").replace(/\s*\([^)]*\)/, "");
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+      <strong style={{ color: "#e8dcc8" }}>Membrane:</strong>
+      <span style={{ width: 11, height: 11, borderRadius: 3, background: bg, border: "1px solid rgba(255,255,255,0.2)", flexShrink: 0 }} />
+      <span style={{ textTransform: "capitalize" }}>{label || "body palette"}</span>
+      {egg.membraneHex && <span style={{ color: "#6a6050", fontFamily: "monospace", fontSize: 10 }}>{egg.membraneHex}</span>}
+    </div>
+  );
+}
+
 // Reusable copy-to-clipboard prompt block for Flux image generation
 function PromptBlock({ label, prompt }) {
   const [copied, setCopied] = useState(false);
@@ -3229,6 +3298,7 @@ function ClaimEggModal({ egg, clutchHybridLabel, motherId, fatherId, clutchId, o
           <ColorPercentBar percentages={egg.colorPercentages} />
           <div style={{ marginTop: 6 }}><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Wing Shape:</strong> {egg.wingShape?.result}</div>
+          <MembraneSwatch egg={egg} />
           <div><strong style={{ color: "#e8dcc8" }}>Tail Tip:</strong> {egg.tailTip?.result}{acTag} · <strong style={{ color: "#e8dcc8" }}>Head Crest:</strong> {egg.headCrest?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Spines:</strong> {egg.spineType?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Eggs/Clutch:</strong> {egg.eggDisplay}</div>
@@ -3850,6 +3920,7 @@ function WildClaimModal({ egg, clutchName, onClaim, onClose }) {
           <ColorPercentBar percentages={egg.colorPercentages} />
           <div style={{ marginTop: 6 }}><strong style={{ color: "#e8dcc8" }}>Food:</strong> {egg.foodDisplay} · <strong style={{ color: "#e8dcc8" }}>Mood:</strong> {egg.moodDisplay}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Wing Shape:</strong> {egg.wingShape?.result}</div>
+          <MembraneSwatch egg={egg} />
           <div><strong style={{ color: "#e8dcc8" }}>Tail / Crest / Spines:</strong> {egg.tailTip?.result} · {egg.headCrest?.result} · {egg.spineType?.result}</div>
           <div><strong style={{ color: "#e8dcc8" }}>Eggs/Clutch:</strong> {egg.eggDisplay}</div>
           {egg.hasRBParent && <div><strong style={{ color: "#e8dcc8" }}>Lifecycle:</strong> <span style={{ color: "#c48ae0" }}>{egg.lifecycleStages?.join(" → ")}</span></div>}
