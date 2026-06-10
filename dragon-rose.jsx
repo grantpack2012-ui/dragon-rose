@@ -1995,7 +1995,7 @@ function RosterProvider({ children }) {
     try { const h = await window.storage.get("dragon-custom-hybrids"); setCustomHybrids(h?.value ? JSON.parse(h.value) : []); } catch (_) {}
     try { const p = await window.storage.get("dragon-pairs"); setPairs(p?.value ? JSON.parse(p.value) : []); } catch (_) {}
     try { const w = await window.storage.get("dragon-wild-clutches"); setWildClutches(w?.value ? JSON.parse(w.value) : []); } catch (_) {}
-    try { const pt = await window.storage.get("dragon-partners"); setPartners(pt?.value ? JSON.parse(pt.value) : []); } catch (_) {}
+    try { const pt = await window.storage.get("dragon-partners"); if (pt?.value) { /* legacy world_state partners ignored; partners now live in their own table */ } } catch (_) {}
     try { const d = await window.storage.get("dragon-discovered-hybrids"); setDiscoveredHybrids(new Set(d?.value ? JSON.parse(d.value) : [])); } catch (_) {}
   }, []);
 
@@ -2028,28 +2028,37 @@ function RosterProvider({ children }) {
     } catch (_) { /* keep prior state on error */ }
   }, [user]);
 
+  const loadPartners = useCallback(async () => {
+    if (!user) { setPartners([]); return; }
+    try {
+      const { data, error } = await supabase.from("partners").select("*").eq("world_id", SHARED_WORLD_ID).order("created_at", { ascending: true });
+      if (error) throw error;
+      setPartners((data || []).map(p => ({ id: p.id, name: p.name, bio: p.bio || "", registeredAt: p.created_at, userId: p.user_id })));
+    } catch (_) { /* keep prior state on error */ }
+  }, [user]);
+
   useEffect(() => {
     let active = true;
-    (async () => { await loadContent(); await loadClaims(); if (active) setLoaded(true); })();
+    (async () => { await loadContent(); await loadClaims(); await loadPartners(); if (active) setLoaded(true); })();
     return () => { active = false; };
-  }, [loadContent, loadClaims]);
+  }, [loadContent, loadClaims, loadPartners]);
 
-  // ---- Real-time sync: content + claims ----
+  // ---- Real-time sync: content + claims + partners ----
   useEffect(() => {
     if (!user) return;
     const channel = supabase
       .channel("dragonrose-shared")
       .on("postgres_changes", { event: "*", schema: "public", table: "world_state", filter: `world_id=eq.${SHARED_WORLD_ID}` }, () => { loadContent(); })
       .on("postgres_changes", { event: "*", schema: "public", table: "claims", filter: `world_id=eq.${SHARED_WORLD_ID}` }, () => { loadClaims(); })
+      .on("postgres_changes", { event: "*", schema: "public", table: "partners", filter: `world_id=eq.${SHARED_WORLD_ID}` }, () => { loadPartners(); })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [user, loadContent, loadClaims]);
+  }, [user, loadContent, loadClaims, loadPartners]);
 
   // ---- Content persistence (admin-written via world_state; RLS enforces) ----
   const persistHybrids = async (next) => { setCustomHybrids(next); try { await window.storage.set("dragon-custom-hybrids", JSON.stringify(next)); } catch (_) {} };
   const persistPairs = async (next) => { setPairs(next); try { await window.storage.set("dragon-pairs", JSON.stringify(next)); } catch (_) {} };
   const persistWildClutches = async (next) => { setWildClutches(next); try { await window.storage.set("dragon-wild-clutches", JSON.stringify(next)); } catch (_) {} };
-  const persistPartners = async (next) => { setPartners(next); try { await window.storage.set("dragon-partners", JSON.stringify(next)); } catch (_) {} };
 
   const discoverHybrid = (hybridName) => {
     if (!hybridName) return;
@@ -2147,9 +2156,26 @@ function RosterProvider({ children }) {
   const updateWildClutch = (id, patch) => { persistWildClutches(wildClutches.map(c => c.id === id ? { ...c, ...patch } : c)); };
   const removeWildClutch = (id) => { persistWildClutches(wildClutches.filter(c => c.id !== id)); };
 
-  const addPartner = (p) => { persistPartners([...partners, p]); };
-  const updatePartner = (id, patch) => { persistPartners(partners.map(p => p.id === id ? { ...p, ...patch } : p)); };
-  const removePartner = (id) => { persistPartners(partners.filter(p => p.id !== id)); };
+  const addPartner = async (p) => {
+    if (!user) return;
+    try {
+      await supabase.from("partners").insert({
+        world_id: SHARED_WORLD_ID,
+        user_id: null,          // admin-created NPC partner (auto-partners are made by the signup trigger)
+        name: p.name,
+        bio: p.bio || null,
+      });
+    } catch (_) {}
+    loadPartners();
+  };
+  const updatePartner = async (id, patch) => {
+    try { await supabase.from("partners").update({ name: patch.name, bio: patch.bio || null }).eq("id", id); } catch (_) {}
+    loadPartners();
+  };
+  const removePartner = async (id) => {
+    try { await supabase.from("partners").delete().eq("id", id); } catch (_) {}
+    loadPartners();
+  };
 
   return (
     <RosterContext.Provider value={{
@@ -4824,11 +4850,11 @@ function AdoptionDen() {
       {tab === "partners" && (
         <div>
           <div style={{ marginBottom: 16 }}>
-            {!showPartnerForm ? (
+            {isAdmin && (!showPartnerForm ? (
               <button onClick={() => setShowPartnerForm(true)} style={{
                 padding: "8px 20px", borderRadius: 8, border: "1px solid rgba(200,148,63,0.4)", background: "rgba(200,148,63,0.08)",
                 color: "#c8943f", fontFamily: "'Cinzel', serif", fontSize: 12, letterSpacing: 1, cursor: "pointer",
-              }}>+ Register Partner</button>
+              }}>+ Register Partner (NPC)</button>
             ) : (
               <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(200,148,63,0.25)", borderRadius: 10, padding: "16px 18px", marginBottom: 16 }}>
                 <div style={{ fontFamily: "'Cinzel', serif", fontSize: 12, color: "#c8943f", letterSpacing: 1, marginBottom: 12 }}>Register New Partner</div>
@@ -4847,7 +4873,7 @@ function AdoptionDen() {
                   </div>
                 </div>
               </div>
-            )}
+            ))}
           </div>
 
           {partners.length === 0 ? (
