@@ -1,31 +1,79 @@
 import { useState, useMemo, useCallback, useEffect, createContext, useContext } from "react";
-import { supabase } from "./supabase";
+import { supabase, SHARED_WORLD_ID } from "./supabase";
 
 // ============================================================
-// STORAGE SHIM — localStorage drop-in for window.storage API
-// Allows the app to run outside of Claude artifacts (Netlify, etc.)
+// SHARED-WORLD STORAGE
+// Shared content (clutches, breeding pairs, hybrids, partners) lives in the
+// Supabase `world_state` table — admin-written, readable by every signed-in
+// Bonded. Falls back to localStorage when signed out or on any error, so the
+// app still works offline / before login.
 // ============================================================
+const localStore = {
+  get: async (key) => {
+    const value = localStorage.getItem(key);
+    return value !== null ? { key, value } : null;
+  },
+  set: async (key, value) => { localStorage.setItem(key, value); return { key, value }; },
+  delete: async (key) => { localStorage.removeItem(key); return { key, deleted: true }; },
+  list: async (prefix) => {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!prefix || k.startsWith(prefix)) keys.push(k);
+    }
+    return { keys };
+  },
+};
+
+async function isSignedIn() {
+  try { const { data } = await supabase.auth.getSession(); return !!data?.session; }
+  catch { return false; }
+}
+
 if (typeof window !== "undefined" && !window.storage) {
   window.storage = {
     get: async (key) => {
-      const value = localStorage.getItem(key);
-      return value !== null ? { key, value } : null;
+      if (!(await isSignedIn())) return localStore.get(key);
+      try {
+        const { data, error } = await supabase
+          .from("world_state").select("value")
+          .eq("world_id", SHARED_WORLD_ID).eq("key", key).maybeSingle();
+        if (error) throw error;
+        if (!data) return null;
+        const value = typeof data.value === "string" ? data.value : JSON.stringify(data.value);
+        return { key, value };
+      } catch { return localStore.get(key); }
     },
     set: async (key, value) => {
-      localStorage.setItem(key, value);
-      return { key, value };
+      if (!(await isSignedIn())) return localStore.set(key, value);
+      try {
+        let parsed; try { parsed = JSON.parse(value); } catch { parsed = value; }
+        const { error } = await supabase.from("world_state").upsert(
+          { world_id: SHARED_WORLD_ID, key, value: parsed, updated_at: new Date().toISOString() },
+          { onConflict: "world_id,key" }
+        );
+        if (error) throw error; // non-admins are rejected by RLS — caught below
+        return { key, value };
+      } catch { return localStore.set(key, value); }
     },
     delete: async (key) => {
-      localStorage.removeItem(key);
-      return { key, deleted: true };
+      if (!(await isSignedIn())) return localStore.delete(key);
+      try {
+        const { error } = await supabase.from("world_state").delete()
+          .eq("world_id", SHARED_WORLD_ID).eq("key", key);
+        if (error) throw error;
+        return { key, deleted: true };
+      } catch { return localStore.delete(key); }
     },
     list: async (prefix) => {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (!prefix || k.startsWith(prefix)) keys.push(k);
-      }
-      return { keys };
+      if (!(await isSignedIn())) return localStore.list(prefix);
+      try {
+        const { data, error } = await supabase
+          .from("world_state").select("key").eq("world_id", SHARED_WORLD_ID);
+        if (error) throw error;
+        const keys = (data || []).map(r => r.key).filter(k => !prefix || k.startsWith(prefix));
+        return { keys };
+      } catch { return localStore.list(prefix); }
     },
   };
 }
@@ -1929,7 +1977,12 @@ function generateHybridTraits(keyA, keyB, customHybrids = []) {
 const RosterContext = createContext(null);
 
 function RosterProvider({ children }) {
-  const [roster, setRoster] = useState([]);
+  const auth = useAuth ? useAuth() : null;
+  const user = auth?.user || null;
+  const isAdmin = auth?.isAdmin || false;
+
+  const [roster, setRoster] = useState([]);          // current user's claimed dragons
+  const [claimsByEgg, setClaimsByEgg] = useState({}); // egg_id -> { name, userId } for ALL claims
   const [customHybrids, setCustomHybrids] = useState([]);
   const [pairs, setPairs] = useState([]);
   const [wildClutches, setWildClutches] = useState([]);
@@ -1937,26 +1990,67 @@ function RosterProvider({ children }) {
   const [discoveredHybrids, setDiscoveredHybrids] = useState(new Set());
   const [loaded, setLoaded] = useState(false);
 
-  useEffect(() => {
-    async function load() {
-      try { const r = await window.storage.get("dragon-roster"); if (r?.value) setRoster(JSON.parse(r.value)); } catch (_) {}
-      try { const h = await window.storage.get("dragon-custom-hybrids"); if (h?.value) setCustomHybrids(JSON.parse(h.value)); } catch (_) {}
-      try { const p = await window.storage.get("dragon-pairs"); if (p?.value) setPairs(JSON.parse(p.value)); } catch (_) {}
-      try { const w = await window.storage.get("dragon-wild-clutches"); if (w?.value) setWildClutches(JSON.parse(w.value)); } catch (_) {}
-      try { const pt = await window.storage.get("dragon-partners"); if (pt?.value) setPartners(JSON.parse(pt.value)); } catch (_) {}
-      try { const d = await window.storage.get("dragon-discovered-hybrids"); if (d?.value) setDiscoveredHybrids(new Set(JSON.parse(d.value))); } catch (_) {}
-      setLoaded(true);
-    }
-    load();
+  // ---- Load shared content (world_state) ----
+  const loadContent = useCallback(async () => {
+    try { const h = await window.storage.get("dragon-custom-hybrids"); setCustomHybrids(h?.value ? JSON.parse(h.value) : []); } catch (_) {}
+    try { const p = await window.storage.get("dragon-pairs"); setPairs(p?.value ? JSON.parse(p.value) : []); } catch (_) {}
+    try { const w = await window.storage.get("dragon-wild-clutches"); setWildClutches(w?.value ? JSON.parse(w.value) : []); } catch (_) {}
+    try { const pt = await window.storage.get("dragon-partners"); setPartners(pt?.value ? JSON.parse(pt.value) : []); } catch (_) {}
+    try { const d = await window.storage.get("dragon-discovered-hybrids"); setDiscoveredHybrids(new Set(d?.value ? JSON.parse(d.value) : [])); } catch (_) {}
   }, []);
 
-  const persistRoster = async (next) => { setRoster(next); try { await window.storage.set("dragon-roster", JSON.stringify(next)); } catch (_) {} };
+  // ---- Load claims (roster = mine; claimsByEgg = everyone's) ----
+  const loadClaims = useCallback(async () => {
+    if (!user) {
+      // Signed out — fall back to a local roster, derive claimed map from it
+      let local = [];
+      try { const r = await window.storage.get("dragon-roster"); local = r?.value ? JSON.parse(r.value) : []; } catch (_) { local = []; }
+      setRoster(local);
+      const map = {};
+      local.forEach(e => { const k = e._eggId || e.id; if (k) map[k] = { name: e.name, userId: "local" }; });
+      setClaimsByEgg(map);
+      return;
+    }
+    try {
+      const { data, error } = await supabase.from("claims").select("*").eq("world_id", SHARED_WORLD_ID);
+      if (error) throw error;
+      const map = {};
+      const mine = [];
+      (data || []).forEach(c => {
+        map[c.egg_id] = { name: c.dragon_name, userId: c.user_id };
+        if (c.user_id === user.id) {
+          const snap = c.egg_snapshot || {};
+          mine.push({ ...snap, id: snap.id || c.id, name: c.dragon_name, gender: c.gender, bondStory: c.bond_story, firstWords: c.first_words, _claimId: c.id, _eggId: c.egg_id });
+        }
+      });
+      setClaimsByEgg(map);
+      setRoster(mine);
+    } catch (_) { /* keep prior state on error */ }
+  }, [user]);
+
+  useEffect(() => {
+    let active = true;
+    (async () => { await loadContent(); await loadClaims(); if (active) setLoaded(true); })();
+    return () => { active = false; };
+  }, [loadContent, loadClaims]);
+
+  // ---- Real-time sync: content + claims ----
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel("dragonrose-shared")
+      .on("postgres_changes", { event: "*", schema: "public", table: "world_state", filter: `world_id=eq.${SHARED_WORLD_ID}` }, () => { loadContent(); })
+      .on("postgres_changes", { event: "*", schema: "public", table: "claims", filter: `world_id=eq.${SHARED_WORLD_ID}` }, () => { loadClaims(); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [user, loadContent, loadClaims]);
+
+  // ---- Content persistence (admin-written via world_state; RLS enforces) ----
   const persistHybrids = async (next) => { setCustomHybrids(next); try { await window.storage.set("dragon-custom-hybrids", JSON.stringify(next)); } catch (_) {} };
   const persistPairs = async (next) => { setPairs(next); try { await window.storage.set("dragon-pairs", JSON.stringify(next)); } catch (_) {} };
   const persistWildClutches = async (next) => { setWildClutches(next); try { await window.storage.set("dragon-wild-clutches", JSON.stringify(next)); } catch (_) {} };
   const persistPartners = async (next) => { setPartners(next); try { await window.storage.set("dragon-partners", JSON.stringify(next)); } catch (_) {} };
 
-  // Discover a hybrid by name — finds its canon key and marks it seen
   const discoverHybrid = (hybridName) => {
     if (!hybridName) return;
     const canonEntry = Object.entries(HYBRIDS).find(([, h]) => h.name === hybridName);
@@ -1968,9 +2062,79 @@ function RosterProvider({ children }) {
     try { window.storage.set("dragon-discovered-hybrids", JSON.stringify([...next])); } catch (_) {}
   };
 
-  const addToRoster = (entry) => { persistRoster([...roster, entry]); };
-  const removeFromRoster = (id) => { persistRoster(roster.filter((d) => d.id !== id)); };
-  const updateRoster = (id, patch) => { persistRoster(roster.map((d) => d.id === id ? { ...d, ...patch } : d)); };
+  // ---- Roster = claims. A dragon is "claimed" when a claim row exists for its egg id. ----
+  const addToRoster = async (entry, eggId) => {
+    const egg_id = eggId || entry.id;
+    if (!user) {
+      // Signed out — local roster only
+      const stored = { ...entry, _eggId: egg_id };
+      const next = [...roster, stored];
+      setRoster(next);
+      setClaimsByEgg(prev => ({ ...prev, [egg_id]: { name: entry.name, userId: "local" } }));
+      try { await window.storage.set("dragon-roster", JSON.stringify(next)); } catch (_) {}
+      return { error: null };
+    }
+    // Optimistic
+    setRoster(prev => [...prev, { ...entry, _eggId: egg_id }]);
+    setClaimsByEgg(prev => ({ ...prev, [egg_id]: { name: entry.name, userId: user.id } }));
+    try {
+      const { error } = await supabase.from("claims").insert({
+        world_id: SHARED_WORLD_ID,
+        clutch_id: String(entry.clutchId || ""),
+        egg_id: String(egg_id),
+        user_id: user.id,
+        dragon_name: entry.name || "Unnamed",
+        gender: entry.gender || "unknown",
+        bond_story: entry.bondStory || null,
+        first_words: entry.firstWords || null,
+        egg_snapshot: entry,
+      });
+      if (error) throw error;
+      loadClaims();
+      return { error: null };
+    } catch (e) {
+      // Roll back optimistic update (likely the egg was already claimed)
+      loadClaims();
+      return { error: e };
+    }
+  };
+
+  const removeFromRoster = async (entryId) => {
+    const entry = roster.find(d => d.id === entryId);
+    if (!user) {
+      const next = roster.filter(d => d.id !== entryId);
+      setRoster(next);
+      try { await window.storage.set("dragon-roster", JSON.stringify(next)); } catch (_) {}
+      return;
+    }
+    const claimId = entry?._claimId;
+    if (claimId) {
+      try { await supabase.from("claims").delete().eq("id", claimId); } catch (_) {}
+    }
+    loadClaims();
+  };
+
+  const updateRoster = async (entryId, patch) => {
+    const entry = roster.find(d => d.id === entryId);
+    if (!user) {
+      const next = roster.map(d => d.id === entryId ? { ...d, ...patch } : d);
+      setRoster(next);
+      try { await window.storage.set("dragon-roster", JSON.stringify(next)); } catch (_) {}
+      return;
+    }
+    if (!entry?._claimId) return;
+    const merged = { ...entry, ...patch };
+    try {
+      await supabase.from("claims").update({
+        dragon_name: merged.name,
+        gender: merged.gender || "unknown",
+        bond_story: merged.bondStory || null,
+        first_words: merged.firstWords || null,
+        egg_snapshot: merged,
+      }).eq("id", entry._claimId);
+    } catch (_) {}
+    loadClaims();
+  };
 
   const addCustomHybrid = (entry) => { persistHybrids([...customHybrids, entry]); };
   const removeCustomHybrid = (key) => { persistHybrids(customHybrids.filter((h) => h.key !== key)); };
@@ -1990,6 +2154,7 @@ function RosterProvider({ children }) {
   return (
     <RosterContext.Provider value={{
       roster, customHybrids, pairs, wildClutches, partners, discoveredHybrids, loaded,
+      claimsByEgg, isAdmin,
       addToRoster, removeFromRoster, updateRoster,
       addCustomHybrid, removeCustomHybrid,
       addPair, removePair, updatePair,
@@ -3497,7 +3662,8 @@ function EggTile({ egg, onClaim }) {
 }
 
 // Claimed egg tile — shows name badge
-function ClaimedEggTile({ egg }) {
+function ClaimedEggTile({ egg, claimedName }) {
+  const label = claimedName || egg.claimedName || "Claimed";
   return (
     <div style={{
       display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
@@ -3508,7 +3674,7 @@ function ClaimedEggTile({ egg }) {
         <EggShape egg={egg} size={42} borderColor="rgba(126,200,126,0.3)" />
         <div style={{ position: "absolute", bottom: -2, right: -2, fontSize: 10 }}>✓</div>
       </div>
-      <div style={{ fontSize: 9, color: "#7ec87e", fontFamily: "'Cinzel', serif", letterSpacing: 1, textAlign: "center", maxWidth: 52, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{egg.claimedName}</div>
+      <div style={{ fontSize: 9, color: "#7ec87e", fontFamily: "'Cinzel', serif", letterSpacing: 1, textAlign: "center", maxWidth: 52, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</div>
     </div>
   );
 }
@@ -3703,7 +3869,7 @@ function ClaimEggModal({ egg, clutchHybridLabel, motherId, fatherId, clutchId, o
     entry.motherId = motherId || null;
     entry.fatherId = fatherId || null;
     entry.clutchId = clutchId;
-    addToRoster(entry);
+    addToRoster(entry, egg.id);   // egg.id gives the atomic one-claim-per-egg guarantee
     onClaim(name, entry);
   };
 
@@ -3795,8 +3961,10 @@ function ClutchSection({ clutch, pair, onEggClaimed, offspringLabel }) {
   const [open, setOpen] = useState(false);
   const [claimingEgg, setClaimingEgg] = useState(null);
   const [exporting, setExporting] = useState(false);
+  const { claimsByEgg = {} } = useRoster() || {};
 
-  const claimed = clutch.eggs.filter(e => e.claimed).length;
+  const isClaimed = (e) => !!claimsByEgg[e.id];
+  const claimed = clutch.eggs.filter(isClaimed).length;
   const total = clutch.eggs.length;
   const hybridLabel = clutch.hybridLabel || offspringLabel || "";
 
@@ -3824,12 +3992,12 @@ function ClutchSection({ clutch, pair, onEggClaimed, offspringLabel }) {
       {open && (
         <div style={{ padding: "12px 14px", background: "rgba(0,0,0,0.15)", borderTop: "1px solid rgba(255,255,255,0.05)" }}>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {clutch.eggs.map(egg => egg.claimed
-              ? <ClaimedEggTile key={egg.id} egg={egg} />
+            {clutch.eggs.map(egg => isClaimed(egg)
+              ? <ClaimedEggTile key={egg.id} egg={egg} claimedName={claimsByEgg[egg.id]?.name} />
               : <EggTile key={egg.id} egg={egg} onClaim={() => setClaimingEgg(egg)} />
             )}
           </div>
-          {clutch.eggs.every(e => e.claimed) && (
+          {clutch.eggs.every(isClaimed) && (
             <div style={{ marginTop: 8, fontSize: 11, color: "#7ec87e", fontFamily: "'Crimson Text', serif", fontStyle: "italic" }}>
               All eggs from this clutch have been claimed.
             </div>
@@ -3853,7 +4021,7 @@ function ClutchSection({ clutch, pair, onEggClaimed, offspringLabel }) {
           fatherId={pair.fatherId}
           clutchId={clutch.id}
           onClaim={(name, entry) => {
-            onEggClaimed(clutch.id, claimingEgg.id, name, entry.id);
+            if (onEggClaimed) onEggClaimed(clutch.id, claimingEgg.id, name, entry.id);
             setClaimingEgg(null);
           }}
           onClose={() => setClaimingEgg(null)}
@@ -3864,7 +4032,7 @@ function ClutchSection({ clutch, pair, onEggClaimed, offspringLabel }) {
 }
 
 function PairCard({ pair }) {
-  const { roster, customHybrids = [], removePair, updatePair, discoverHybrid } = useRoster() || {};
+  const { roster, customHybrids = [], removePair, updatePair, discoverHybrid, claimsByEgg = {}, isAdmin } = useRoster() || {};
   const [expanded, setExpanded] = useState(true);
 
   const mother = roster.find(d => d.id === pair.motherId);
@@ -3875,7 +4043,7 @@ function PairCard({ pair }) {
   const motherEggs = mother ? (parseInt(resolveEggDisplay(mother.eggCode)) || 4) : 4;
   const clutches = pair.clutches || [];
   const totalEggs = clutches.reduce((s, c) => s + c.eggs.length, 0);
-  const claimedEggs = clutches.reduce((s, c) => s + c.eggs.filter(e => e.claimed).length, 0);
+  const claimedEggs = clutches.reduce((s, c) => s + c.eggs.filter(e => claimsByEgg[e.id]).length, 0);
 
   // Derive parent keys for hybrid registration
   const mProxy = mother ? rosterEntryToProxy(mother, customHybrids) : null;
@@ -3971,13 +4139,13 @@ function PairCard({ pair }) {
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={layClutch} disabled={!mother || !father} style={{
+          {isAdmin && <button onClick={layClutch} disabled={!mother || !father} style={{
             padding: "6px 14px", borderRadius: 6, border: "none", fontSize: 11, fontWeight: 700, letterSpacing: 1,
             cursor: (mother && father) ? "pointer" : "not-allowed",
             background: (mother && father) ? "linear-gradient(135deg, #c8943f, #a0742f)" : "rgba(255,255,255,0.05)",
             color: (mother && father) ? "#1a1a2e" : "#555", fontFamily: "'Cinzel', serif",
-          }}>🥚 Lay Clutch</button>
-          <button onClick={() => removePair(pair.id)} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#5a4a3a", fontFamily: "'Cinzel', serif", fontSize: 11, cursor: "pointer" }}>Unbond</button>
+          }}>🥚 Lay Clutch</button>}
+          {isAdmin && <button onClick={() => removePair(pair.id)} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#5a4a3a", fontFamily: "'Cinzel', serif", fontSize: 11, cursor: "pointer" }}>Unbond</button>}
         </div>
       </div>
 
@@ -4326,7 +4494,7 @@ function WildClaimModal({ egg, clutchName, onClaim, onClose }) {
     entry.wildClaim = true;
     entry.clutchName = clutchName;
     entry.claimedBy = partnerId || null;
-    addToRoster(entry);
+    addToRoster(entry, egg.id);
     onClaim(name, entry.id, partnerId);
   };
 
@@ -4411,22 +4579,18 @@ function WildClaimModal({ egg, clutchName, onClaim, onClose }) {
 
 // Single wild clutch card
 function WildClutchCard({ clutch }) {
-  const { updateWildClutch, removeWildClutch } = useRoster() || {};
+  const { updateWildClutch, removeWildClutch, claimsByEgg = {}, isAdmin } = useRoster() || {};
   const [claimingEgg, setClaimingEgg] = useState(null);
   const [open, setOpen] = useState(true);
   const [exporting, setExporting] = useState(false);
 
-  const claimed = clutch.eggs.filter(e => e.claimed).length;
+  const isClaimed = (e) => !!claimsByEgg[e.id];
+  const claimed = clutch.eggs.filter(isClaimed).length;
   const total = clutch.eggs.length;
   const allClaimed = claimed === total;
 
   const handleClaim = (name, rosterId, partnerId) => {
-    const updated = clutch.eggs.map(e =>
-      e.id === claimingEgg.id
-        ? { ...e, claimed: true, claimedName: name, claimedRosterId: rosterId, claimedBy: partnerId || null }
-        : e
-    );
-    updateWildClutch(clutch.id, { eggs: updated });
+    // Claim is recorded in the claims table by the modal; nothing to mutate here.
     setClaimingEgg(null);
   };
 
@@ -4446,15 +4610,15 @@ function WildClutchCard({ clutch }) {
             {claimed}/{total} claimed · Generated {new Date(clutch.createdAt).toLocaleDateString()}
           </div>
         </div>
-        <button onClick={() => removeWildClutch(clutch.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a4a3a", fontSize: 13, padding: "2px 6px" }} title="Archive clutch">✕</button>
+        {isAdmin && <button onClick={() => removeWildClutch(clutch.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a4a3a", fontSize: 13, padding: "2px 6px" }} title="Archive clutch">✕</button>}
       </div>
 
       {/* Egg grid */}
       {open && (
         <div style={{ padding: "16px 20px" }}>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
-            {clutch.eggs.map(egg => egg.claimed ? (
-              <ClaimedEggTile key={egg.id} egg={egg} />
+            {clutch.eggs.map(egg => isClaimed(egg) ? (
+              <ClaimedEggTile key={egg.id} egg={egg} claimedName={claimsByEgg[egg.id]?.name} />
             ) : (
               <WildEggTile key={egg.id} egg={egg} onClaim={() => setClaimingEgg(egg)} />
             ))}
@@ -4544,7 +4708,7 @@ function PartnerCard({ partner }) {
 }
 
 function AdoptionDen() {
-  const { wildClutches = [], partners = [], addWildClutch, addPartner } = useRoster() || {};
+  const { wildClutches = [], partners = [], addWildClutch, addPartner, claimsByEgg = {}, isAdmin } = useRoster() || {};
   const [tab, setTab] = useState("clutches"); // "clutches" | "partners"
   const [newClutchName, setNewClutchName] = useState("");
   const [showNameInput, setShowNameInput] = useState(false);
@@ -4570,8 +4734,9 @@ function AdoptionDen() {
     setNewPartnerName(""); setNewPartnerBio(""); setShowPartnerForm(false);
   };
 
-  const activeClutches = wildClutches.filter(c => !c.eggs.every(e => e.claimed));
-  const archivedClutches = wildClutches.filter(c => c.eggs.every(e => e.claimed));
+  const allClaimed = (c) => c.eggs.every(e => claimsByEgg[e.id]);
+  const activeClutches = wildClutches.filter(c => !allClaimed(c));
+  const archivedClutches = wildClutches.filter(allClaimed);
 
   const tabStyle = (t) => ({
     padding: "8px 20px", border: "none", cursor: "pointer",
@@ -4605,7 +4770,8 @@ function AdoptionDen() {
       {/* CLUTCHES TAB */}
       {tab === "clutches" && (
         <div>
-          {/* Generate controls */}
+          {/* Generate controls — admins only */}
+          {isAdmin && (
           <div style={{ marginBottom: 20 }}>
             {!showNameInput ? (
               <button onClick={() => setShowNameInput(true)} style={{
@@ -4627,9 +4793,12 @@ function AdoptionDen() {
               </div>
             )}
           </div>
+          )}
 
           <div style={{ fontSize: 11, color: "#6a6050", fontFamily: "'Crimson Text', serif", marginBottom: 16, fontStyle: "italic" }}>
-            Each wild clutch contains 16 eggs: 2 of each of the 7 base species + 2 special eggs (Silver Filament or mutation carriers). ✦ marks special eggs.
+            {isAdmin
+              ? "Each wild clutch contains 16 eggs: 2 of each of the 7 base species + 2 special eggs (Silver Filament or mutation carriers). ✦ marks special eggs."
+              : "Browse the wild clutches below and click any egg to reveal its genetics and claim it. ✦ marks special eggs (Silver Filament or mutation carriers)."}
           </div>
 
           {activeClutches.length === 0 && archivedClutches.length === 0 && (
